@@ -1,0 +1,26 @@
+name: Sync 360Giving Data
+
+# Runs every Sunday at 2 AM UTC
+# Alternative to Vercel Cron for non-Vercel deployments
+on:
+  schedule:
+    - cron: "0 2 * * 0"
+  workflow_dispatch: # Allow manual triggering
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Trigger sync endpoint
+        run: |
+          curl -X POST \
+            -H "Authorization: Bearer ${{ secrets.CRON_SECRET }}" \
+            -H "Content-Type: application/json" \
+            ${{ secrets.APP_URL }}/api/sync/cron
+
+      - name: Check sync status
+        if: failure()
+        run: |
+          echo "Sync failed. Check application logs for details."
+          exit 1
