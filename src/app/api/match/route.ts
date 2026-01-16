@@ -11,16 +11,24 @@ interface MatchResponse {
   matches?: FunderMatch[];
   error?: string;
   message?: string;
+  cached?: boolean;
 }
 
 /**
  * POST /api/match
  * Trigger AI-powered funder matching for a charity profile
+ * 
+ * Query params:
+ * - refresh=true: Bypass cache and force fresh AI analysis
  */
 export async function POST(
   request: NextRequest
 ): Promise<NextResponse<MatchResponse>> {
   try {
+    // Check for refresh parameter
+    const { searchParams } = new URL(request.url);
+    const forceRefresh = searchParams.get("refresh") === "true";
+
     // Parse request body
     const body: MatchRequest = await request.json();
 
@@ -49,11 +57,11 @@ export async function POST(
 
     // Log the matching request
     console.log(
-      `Starting AI matching for charity: ${charityProfile.charity_name} (${charityProfile.reg_charity_number})`
+      `Starting AI matching for charity: ${charityProfile.charity_name} (${charityProfile.reg_charity_number})${forceRefresh ? " [FORCE REFRESH]" : ""}`
     );
 
-    // Call AI matching function
-    const matches = await matchFunders(charityProfile);
+    // Call AI matching function with cache option
+    const matches = await matchFunders(charityProfile, { forceRefresh });
 
     // Log results
     console.log(
@@ -65,6 +73,7 @@ export async function POST(
       success: true,
       matches,
       message: `Successfully matched ${matches.length} funders`,
+      cached: !forceRefresh, // Indicates result may be from cache
     });
   } catch (error) {
     console.error("Error in /api/match:", error);
@@ -89,8 +98,16 @@ export async function GET(): Promise<NextResponse> {
     endpoint: "/api/match",
     method: "POST",
     description: "AI-powered funder matching for UK charities",
+    caching: {
+      enabled: true,
+      ttl: "7 days",
+      description: "Results are cached based on charity details and funder list. Use ?refresh=true to bypass cache.",
+    },
     usage: {
       method: "POST",
+      query_params: {
+        refresh: "boolean (optional) - Set to 'true' to bypass cache and force fresh AI analysis",
+      },
       body: {
         charityProfile: {
           charity_name: "string",
@@ -106,6 +123,7 @@ export async function GET(): Promise<NextResponse> {
         success: "boolean",
         matches: "FunderMatch[] (array of matched funders with scores)",
         message: "string",
+        cached: "boolean (indicates if result may be from cache)",
       },
     },
     example_request: {

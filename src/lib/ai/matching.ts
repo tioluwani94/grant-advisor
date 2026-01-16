@@ -6,6 +6,10 @@ import type {
   Organisation,
   Grant,
 } from "@/types";
+import crypto from "crypto";
+
+// Cache configuration
+const CACHE_TTL_DAYS = 7;
 
 interface FunderWithGrants {
   funder: Organisation;
@@ -29,6 +33,162 @@ interface MatchResponseItem {
     award_date: string;
     grant_purpose: string;
   }>;
+}
+
+interface CacheResult {
+  hit: boolean;
+  matches?: FunderMatch[];
+  cacheKey?: string;
+  createdAt?: string;
+}
+
+/**
+ * Generate a cache key based on charity details and funder list
+ * This ensures cache invalidation when either charity or funder data changes
+ */
+function generateCacheKey(
+  charityProfile: CharityProfile,
+  funderOrgIds: string[]
+): string {
+  // Extract relevant charity details for hashing
+  const charityDetails = {
+    reg_charity_number: charityProfile.reg_charity_number,
+    // Use income range buckets to avoid cache misses on minor changes
+    income_bucket: getIncomeBucket(charityProfile.latest_income || 0),
+    // Hash the activities and beneficiaries
+    activities: charityProfile.who_what_where
+      ?.filter((w) => w.classification_type === "What")
+      .map((w) => w.classification_code)
+      .sort()
+      .join(",") || "",
+    beneficiaries: charityProfile.who_what_where
+      ?.filter((w) => w.classification_type === "Who")
+      .map((w) => w.classification_code)
+      .sort()
+      .join(",") || "",
+    // Geographic areas
+    regions: charityProfile.CharityAoORegion
+      ?.map((r) => r.region)
+      .sort()
+      .join(",") || "",
+  };
+
+  // Sort funder IDs for consistent hashing
+  const sortedFunderIds = [...funderOrgIds].sort().join(",");
+
+  // Create hash from combined data
+  const dataToHash = JSON.stringify({ charityDetails, funderIds: sortedFunderIds });
+  return crypto.createHash("sha256").update(dataToHash).digest("hex").substring(0, 32);
+}
+
+/**
+ * Bucket income into ranges to avoid cache misses on minor changes
+ */
+function getIncomeBucket(income: number): string {
+  if (income < 10000) return "micro";
+  if (income < 100000) return "small";
+  if (income < 500000) return "medium";
+  if (income < 1000000) return "large";
+  if (income < 5000000) return "major";
+  return "national";
+}
+
+/**
+ * Check cache for existing match results
+ */
+async function checkCache(
+  charityNumber: number,
+  cacheKey: string
+): Promise<CacheResult> {
+  try {
+    const { data, error } = await supabase
+      .from("match_cache")
+      .select("matches, created_at, expires_at")
+      .eq("charity_number", charityNumber)
+      .eq("cache_key", cacheKey)
+      .gt("expires_at", new Date().toISOString())
+      .single();
+
+    if (error || !data) {
+      return { hit: false, cacheKey };
+    }
+
+    console.log(`📦 Cache hit for charity ${charityNumber}`);
+    return {
+      hit: true,
+      matches: data.matches as FunderMatch[],
+      cacheKey,
+      createdAt: data.created_at,
+    };
+  } catch {
+    return { hit: false, cacheKey };
+  }
+}
+
+/**
+ * Save match results to cache
+ */
+async function saveToCache(
+  charityProfile: CharityProfile,
+  cacheKey: string,
+  matches: FunderMatch[]
+): Promise<void> {
+  try {
+    // Get the last sync timestamp
+    const { data: lastSync } = await supabase
+      .from("sync_logs")
+      .select("completed_at")
+      .eq("status", "completed")
+      .order("completed_at", { ascending: false })
+      .limit(1)
+      .single();
+
+    const expiresAt = new Date();
+    expiresAt.setDate(expiresAt.getDate() + CACHE_TTL_DAYS);
+
+    await supabase.from("match_cache").upsert(
+      {
+        charity_number: charityProfile.reg_charity_number,
+        cache_key: cacheKey,
+        charity_name: charityProfile.charity_name,
+        matches: matches,
+        funder_count: matches.length,
+        last_sync_at: lastSync?.completed_at || null,
+        created_at: new Date().toISOString(),
+        expires_at: expiresAt.toISOString(),
+      },
+      {
+        onConflict: "charity_number,cache_key",
+      }
+    );
+
+    console.log(`💾 Cached ${matches.length} matches for charity ${charityProfile.reg_charity_number}`);
+  } catch (error) {
+    // Don't fail the request if caching fails
+    console.error("Failed to save to cache:", error);
+  }
+}
+
+/**
+ * Invalidate cache entries older than a given sync date
+ */
+export async function invalidateCacheBeforeSync(syncDate: string): Promise<number> {
+  try {
+    const { data, error } = await supabase
+      .from("match_cache")
+      .delete()
+      .lt("last_sync_at", syncDate)
+      .select("id");
+
+    if (error) {
+      console.error("Failed to invalidate cache:", error);
+      return 0;
+    }
+
+    return data?.length || 0;
+  } catch {
+    return 0;
+  }
 }
 
 /**
@@ -55,10 +215,18 @@ Be specific, evidence-based, and actionable in your recommendations.`;
 
 /**
  * Match a charity profile with the most suitable funders from the database
+ * Results are cached to avoid repeated Claude API calls
+ * 
+ * @param charityProfile - The charity to match
+ * @param options - Optional settings (forceRefresh to bypass cache)
+ * @returns Array of funder matches with scores and reasoning
  */
 export async function matchFunders(
-  charityProfile: CharityProfile
+  charityProfile: CharityProfile,
+  options: { forceRefresh?: boolean } = {}
 ): Promise<FunderMatch[]> {
+  const { forceRefresh = false } = options;
+
   try {
     // Step 1: Query funders with their grant statistics
     const { data: funders, error: fundersError } = await supabase
@@ -76,7 +244,25 @@ export async function matchFunders(
       throw new Error("No funders found in database");
     }
 
-    // Step 2: For each funder, fetch sample grants to analyze
+    // Step 2: Generate cache key based on charity + funder list
+    const funderOrgIds = funders.map((f) => f.org_id);
+    const cacheKey = generateCacheKey(charityProfile, funderOrgIds);
+
+    // Step 3: Check cache (unless force refresh requested)
+    if (!forceRefresh) {
+      const cacheResult = await checkCache(
+        charityProfile.reg_charity_number,
+        cacheKey
+      );
+
+      if (cacheResult.hit && cacheResult.matches) {
+        return cacheResult.matches;
+      }
+    } else {
+      console.log(`🔄 Force refresh requested, bypassing cache`);
+    }
+
+    // Step 4: For each funder, fetch sample grants to analyze
     const fundersWithGrants = await Promise.all(
       funders.map(async (funder) => {
         const { data: grants, error: grantsError } = await supabase
@@ -98,10 +284,11 @@ export async function matchFunders(
       })
     );
 
-    // Step 3: Build the AI analysis prompt
+    // Step 5: Build the AI analysis prompt
     const userPrompt = buildMatchingPrompt(charityProfile, fundersWithGrants);
 
-    // Step 4: Call Claude AI for analysis
+    // Step 6: Call Claude AI for analysis
+    console.log(`🤖 Calling Claude AI for charity ${charityProfile.charity_name}...`);
     const claude = getClaudeClient();
     const response = await claude.messages.create({
       model: "claude-sonnet-4-5-20250929",
@@ -116,7 +303,7 @@ export async function matchFunders(
       ],
     });
 
-    // Step 5: Parse the AI response
+    // Step 7: Parse the AI response
     const textContent = response.content.find((block) => block.type === "text");
     if (!textContent || textContent.type !== "text") {
       throw new Error("No text content in AI response");
@@ -124,8 +311,15 @@ export async function matchFunders(
 
     const matches = parseMatchingResponse(textContent.text, fundersWithGrants);
 
-    // Step 6: Sort by match score and return top 20
-    return matches.sort((a, b) => b.match_score - a.match_score).slice(0, 20);
+    // Step 8: Sort by match score and get top 20
+    const sortedMatches = matches
+      .sort((a, b) => b.match_score - a.match_score)
+      .slice(0, 20);
+
+    // Step 9: Save to cache for future requests
+    await saveToCache(charityProfile, cacheKey, sortedMatches);
+
+    return sortedMatches;
   } catch (error) {
     console.error("Error in matchFunders:", error);
     throw error;
